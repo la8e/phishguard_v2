@@ -1,6 +1,6 @@
 services:
 
-  # ── Lightweight: fast triage, no SHAP, no VirusTotal ────────────────────────
+  # Lightweight: fast triage, no SHAP, no VirusTotal
   phishguard-lite:
     build:
       context: .
@@ -20,7 +20,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
 
-  # ── Full: SHAP explainability + VirusTotal reputation enrichment ─────────────
+  # Full: SHAP explainability + VirusTotal reputation enrichment
   phishguard-full:
     build:
       context: .
@@ -38,7 +38,7 @@ services:
       - PYTHONUNBUFFERED=1
       - VT_API_KEY=${VT_API_KEY:-}
 
-  # ── Standalone: artifacts baked in, only FastText mounted ────────────────────
+  # Standalone: artifacts baked in, only FastText mounted
   phishguard-standalone:
     build:
       context: .
@@ -56,7 +56,7 @@ services:
       - PYTHONUNBUFFERED=1
       - VT_API_KEY=${VT_API_KEY:-}
 
-  # ── Self-contained: zero mounts, fully portable (image ~8-9G) ────────────────
+  # Self-contained: zero mounts, fully portable (image ~8-9G)
   phishguard-selfcontained:
     build:
       context: .

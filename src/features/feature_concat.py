@@ -93,7 +93,7 @@ def extract_manual_features(df: pd.DataFrame) -> np.ndarray:
             .fillna(pd.Series(_FILL_DEFAULTS))
     )
 
-    # Vectorised return-path mismatch (avoids a slow row-by-row apply)
+    # Vectorised return-path mismatch
     sender_col   = df.get("from_header", df.get("sender", pd.Series([""] * len(df))))
     sender_doms  = sender_col.apply(extract_domain)
     return_doms  = df.get("return_path", pd.Series([""] * len(df))).apply(extract_domain)
@@ -141,7 +141,7 @@ def save_feature_eda(X_manual: np.ndarray, y: np.ndarray, eda_dir: str) -> None:
     for i, feat in enumerate(MANUAL_FEATURES):
         data0 = labeled.loc[labeled["label"] == 0, feat]
         data1 = labeled.loc[labeled["label"] == 1, feat]
-        axes[i].boxplot([data0, data1], labels=["Legit", "Phish"],
+        axes[i].boxplot([data0, data1], tick_labels=["Legit", "Phish"],
                         patch_artist=True,
                         boxprops=dict(facecolor="#b3e5fc"))
         axes[i].set_title(feat, fontsize=8)

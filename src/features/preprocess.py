@@ -12,7 +12,7 @@ from multiprocessing import cpu_count
 from typing import Dict, Iterable, List, Optional
 # 3rdP
 import matplotlib
-matplotlib.use("Agg") # non-interactive backend; safe for servers
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -44,7 +44,7 @@ OUTPUT_FILE         = "phishguard_features.csv"
 EDA_DIR             = PROCESSED_DATA_PATH    / "eda"        # EDA artifacts path
 
 MAX_WORKERS   = max(1, cpu_count() - 1)
-CSV_CHUNKSIZE = 50_000          # larger chunks → fewer Python-level iterations
+CSV_CHUNKSIZE = 50_000
 PRINT_INTERVAL = 10_000         # log a progress line every N rows
 #  Label normalisation map
 LABEL_MAP: Dict[str, int] = {
@@ -167,7 +167,7 @@ def normalize_label(value) -> int:
 def safe_find_urls(text: str, use_extractor: bool = False) -> List[str]:
     """
     Extract URLs from text.
-    - use_extractor=False (default, training path): regex only — ~10-50x faster.
+    - use_extractor=False (default, training path): regex only - ~10-50x faster.
     - use_extractor=True  (production path): URLExtract for higher recall on
       obfuscated / bare-domain links, falls back to regex if unavailable.
     """
@@ -245,7 +245,7 @@ def build_features(
     urgent_count  = sum(1 for w in URGENT_WORDS if w in combined.lower())
 
     return {
-        #  Raw text (kept for heuristics and re-inspection) 
+        #  Raw text (for heuristics and re-inspection) 
         "subject":          subject,
         "body":             body,
         "clean_text":       cleaned_text,
@@ -259,7 +259,7 @@ def build_features(
         "x_mailer":         header_fields.get("x_mailer",         ""),
         "x_originating_ip": header_fields.get("x_originating_ip", ""),
         "content_type":     header_fields.get("content_type",     ""),
-        # counts fed directly to the model
+        # counts for the model
         "urls_count":            len(urls),
         "domains_count":          len(dict.fromkeys(domains)),
         "ip_urls_count":          sum(1 for u in urls if IP_URL_RE.match(u)),
@@ -350,7 +350,7 @@ def parse_eml(path: str) -> Optional[Dict]:
     subject = normalize(msg.get("Subject", ""))
     sender  = normalize(msg.get("From",    ""))
     header_fields = _extract_header_fields(msg)
-    # EML version: no hidden html_urls needed (they are merged in body by BeautifulSoup)
+    # EML version
     body_parts, html_present, attachments, _ = _walk_mime(msg)
     body = normalize(" ".join(body_parts))
     urls = safe_find_urls(body)
@@ -378,7 +378,7 @@ def parse_csv_row(row: Dict) -> Optional[Dict]:
     }
     headers_text = str(row.get("raw_headers") or row.get("headers") or "")
     auth_info    = parse_auth_from_headers(headers_text) if headers_text else {}
-    # Normalize string fields once; avoid double-call
+    # Normalize string fields once
     text_fields = [(k, normalize(v)) for k, v in row.items() if isinstance(v, str)]
     text_fields = [(k, v) for k, v in text_fields if v]   # drop empty after normalize
     if not text_fields:
@@ -435,7 +435,7 @@ def process_emls(files: List[str]) -> List[Dict]:
     return results
 
 def _process_chunk(chunk_records: List[Dict]) -> List[Dict]:
-    """Worker: parse a list of raw CSV row dicts → feature dicts. Runs in subprocess."""
+    """Worker: parse a list of raw CSV row dicts -> feature dicts. Runs in subprocess."""
     out = []
     for row in chunk_records:
         try:

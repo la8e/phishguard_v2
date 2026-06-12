@@ -57,10 +57,10 @@ class FastTextFeatureExtractor:
     ) -> None:
         """
         Read the preprocessed CSV, embed every clean_text row, and save:
-          embed_output/X_embeddings.npy  - (N, 300) float32 embedding matrix
-          embed_output/y_labels.npy      - (N,) int32 label vector
+          embed_output/X_embeddings.npy     - (N, 300) float32 embedding matrix
+          embed_output/y_labels.npy         - (N,) int32 label vector
           embed_output/embedding_stats.json - basic embedding stats
-          eda/embedding_norm_dist.png    - L2-norm histogram
+          eda/embedding_norm_dist.png       - L2-norm histogram
         """
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         Path(eda_dir).mkdir(parents=True, exist_ok=True)
@@ -70,19 +70,16 @@ class FastTextFeatureExtractor:
         texts  = df["clean_text"].fillna("").astype(str).values
         labels = df["label"].astype(np.int32).to_numpy()
         print(f"[FastText] {len(texts):,} samples loaded.")
-
         # Embed ........................................................................................
         embeddings = np.zeros((len(texts), self.embed_dim), dtype=np.float32)
         for i in tqdm(range(len(texts)), desc="Embedding", unit="email"):
             embeddings[i] = self.get_embedding(texts[i])
-
         # Save primary artifacts
         x_path = Path(output_dir) / "X_embeddings.npy"
         y_path = Path(output_dir) / "y_labels.npy"
         np.save(x_path, embeddings)
         np.save(y_path, labels)
         print(f"[FastText] Saved:\n  -> {x_path}\n  -> {y_path}")
-
         # embedding statistics JSON
         norms = np.linalg.norm(embeddings, axis=1)
         zero_mask = (norms == 0)
@@ -99,7 +96,6 @@ class FastTextFeatureExtractor:
         with open(stats_path, "w") as f:
             json.dump(stats, f, indent=4)
         print(f"[FastText] Embedding stats -> {stats_path}")
-
         # L2-norm histogram
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.hist(norms[~zero_mask], bins=60, edgecolor="black", color="#3f51b5", alpha=0.85)

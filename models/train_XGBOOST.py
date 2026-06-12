@@ -1,37 +1,18 @@
-#!/usr/bin/env python3
 """
 PhishGuard - XGBoost Training Pipeline (train_XGBOOST.py)
 
-Fixed issues vs. original
-──────────────────────────
-1. best_trial.params called BEFORE optimize() — crash on empty study.
-   Fixed: moved after study.optimize().
-2. Final xgb.train() had no early_stopping_rounds — would blindly run
-   all 2000 rounds regardless of validation loss.
-   Fixed: added evals + early_stopping_rounds to xgb.train().
-3. Top-level script code (data loading, train/test split, study creation)
-   ran at import time — unusable as a module.
-   Fixed: wrapped everything in main().
-4. Spurious syntax error in metadata dict: (,316) on the features line.
-   Fixed.
-
-New additions
-─────────────
-• eval metrics saved to models/eval_metrics.json
-• confusion matrix PNG → models/confusion_matrix.png
-• PR curve PNG        → models/pr_curve.png
-• ROC curve PNG       → models/roc_curve.png
-• Optuna history PNG  → models/optuna_history.png
-• class distribution  → printed and stored in metadata
+- eval metrics saved to models/eval_metrics.json
+- confusion matrix PNG -> models/confusion_matrix.png
+- PR curve PNG         -> models/pr_curve.png
+- ROC curve PNG        -> models/roc_curve.png
+- Optuna history PNG   -> models/optuna_history.png
+- class distribution   -> printed and stored in metadata
 """
-
-# ── Standard library ──────────────────────────────────────────────────────────
 import gc
 import json
 import time
 from pathlib import Path
 
-# ── Third-party ───────────────────────────────────────────────────────────────
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -50,9 +31,8 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ........................................................................................
 # PATHS
-# ══════════════════════════════════════════════════════════════════════════════
 ROOT      = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT / "data" / "processed" / "embed_output" / "xgboost_features.npz"
 MODEL_DIR = ROOT / "models"
@@ -61,13 +41,12 @@ MODEL_DIR.mkdir(exist_ok=True)
 MODEL_PATH          = MODEL_DIR / "phishguard_xgb.json"
 SKL_MODEL_PATH      = MODEL_DIR / "phishguard_xgb.pkl"
 METADATA_PATH       = MODEL_DIR / "model_metadata.json"
-METRICS_PATH        = MODEL_DIR / "eval_metrics.json"      # NEW
+METRICS_PATH        = MODEL_DIR / "eval_metrics.json"
 SHAP_BACKGROUND_PATH= MODEL_DIR / "shap_background.npy"
 OPTUNA_DB           = f"sqlite:///{MODEL_DIR / 'optuna_phishguard.db'}"
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ........................................................................................
 # HYPERPARAMETERS
-# ══════════════════════════════════════════════════════════════════════════════
 RANDOM_STATE      = 42
 N_THREADS         = 2
 N_TRIALS          = 50
@@ -75,19 +54,16 @@ TUNE_SUBSET_SIZE  = 40_000   # rows sampled per Optuna trial
 TUNE_BOOST_ROUNDS = 600
 TUNE_EARLY_STOP   = 25
 FINAL_BOOST_ROUNDS= 2_000
-FINAL_EARLY_STOP  = 50       # FIX: was missing from original
+FINAL_EARLY_STOP  = 50
 SHAP_BG_SIZE      = 1_024
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ........................................................................................
 # PLOT HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _save(fig: plt.Figure, path: Path, label: str = "") -> None:
     fig.savefig(path, bbox_inches="tight", dpi=120)
     plt.close(fig)
     print(f"[plot] {label or path.name} → {path}")
-
 
 def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, path: Path) -> None:
     cm = confusion_matrix(y_true, y_pred)
@@ -104,7 +80,6 @@ def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, path: Path) ->
     plt.colorbar(im, ax=ax)
     _save(fig, path, "confusion matrix")
 
-
 def plot_pr_curve(y_true: np.ndarray, y_prob: np.ndarray, path: Path) -> None:
     prec, rec, _ = precision_recall_curve(y_true, y_prob)
     ap = average_precision_score(y_true, y_prob)
@@ -114,7 +89,6 @@ def plot_pr_curve(y_true: np.ndarray, y_prob: np.ndarray, path: Path) -> None:
     ax.set_title("Precision-Recall Curve")
     ax.legend(); ax.grid(alpha=0.3)
     _save(fig, path, "PR curve")
-
 
 def plot_roc_curve(y_true: np.ndarray, y_prob: np.ndarray, path: Path) -> None:
     fpr, tpr, _ = roc_curve(y_true, y_prob)
@@ -127,7 +101,6 @@ def plot_roc_curve(y_true: np.ndarray, y_prob: np.ndarray, path: Path) -> None:
     ax.legend(); ax.grid(alpha=0.3)
     _save(fig, path, "ROC curve")
 
-
 def plot_optuna_history(study: optuna.Study, path: Path) -> None:
     values = [t.value for t in study.trials if t.value is not None]
     best   = np.maximum.accumulate(values)
@@ -139,14 +112,10 @@ def plot_optuna_history(study: optuna.Study, path: Path) -> None:
     ax.legend(); ax.grid(alpha=0.3)
     _save(fig, path, "Optuna history")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ........................................................................................
 # MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
 def main() -> None:
-
-    # ── 1. Load data ──────────────────────────────────────────────────────────
+    # 1. Load data
     print("Loading dataset ...")
     npz = np.load(DATA_PATH, mmap_mode="r")
     X   = np.array(npz["X"], dtype=np.float32)
@@ -160,14 +129,12 @@ def main() -> None:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
     )
-
-    # ── 2. Class imbalance ────────────────────────────────────────────────────
+    # 2. Class imbalance
     pos = int((y_train == 1).sum())
     neg = int((y_train == 0).sum())
     scale_pos_weight = neg / pos
     print(f"Train positives: {pos:,}  negatives: {neg:,}  scale_pos_weight: {scale_pos_weight:.4f}")
-
-    # ── 3. Base params ────────────────────────────────────────────────────────
+    # 3. Base params
     BASE_PARAMS = {
         "objective":        "binary:logistic",
         "eval_metric":      "aucpr",
@@ -178,8 +145,7 @@ def main() -> None:
         "max_bin":          128,
         "scale_pos_weight": scale_pos_weight,
     }
-
-    # ── 4. Optuna tuning ──────────────────────────────────────────────────────
+    # 4. Optuna tuning
     def objective(trial: optuna.Trial) -> float:
         rng = np.random.RandomState(RANDOM_STATE + trial.number)
         idx = rng.choice(X_train.shape[0], min(TUNE_SUBSET_SIZE, X_train.shape[0]), replace=False)
@@ -227,14 +193,10 @@ def main() -> None:
             callbacks=[_callback],
         )
 
-    # FIX: best_trial access moved to AFTER optimize()
     best_params = study.best_trial.params
     print("Best hyperparameters:", best_params)
-
-    # ── NEW: Optuna history plot ───────────────────────────────────────────────
     plot_optuna_history(study, MODEL_DIR / "optuna_history.png")
-
-    # ── 5. Final model training ───────────────────────────────────────────────
+    # 5. Final model training
     final_params = {**BASE_PARAMS, **best_params, "scale_pos_weight": scale_pos_weight}
     dtrain = xgb.DMatrix(X_train, label=y_train)
     dval   = xgb.DMatrix(X_test,  label=y_test)
@@ -244,14 +206,13 @@ def main() -> None:
         final_params,
         dtrain,
         num_boost_round=FINAL_BOOST_ROUNDS,
-        evals=[(dval, "val")],                       # FIX: added evals
-        early_stopping_rounds=FINAL_EARLY_STOP,      # FIX: added early stopping
+        evals=[(dval, "val")],
+        early_stopping_rounds=FINAL_EARLY_STOP,
         verbose_eval=100,
     )
     model.save_model(MODEL_PATH)
     print(f"Model saved → {MODEL_PATH}")
-
-    # ── 6. Evaluation ─────────────────────────────────────────────────────────
+    # 6. Evaluation
     print("Evaluating ...")
     y_prob   = model.predict(xgb.DMatrix(X_test))
     # Find best F1 threshold on PR curve
@@ -274,8 +235,7 @@ def main() -> None:
     }
     for k, v in metrics.items():
         print(f"  {k}: {v}")
-
-    # ── NEW: save metrics + plots ──────────────────────────────────────────────
+    # save metrics + plots
     with open(METRICS_PATH, "w") as f:
         json.dump(metrics, f, indent=4)
     print(f"Metrics saved → {METRICS_PATH}")
@@ -283,14 +243,12 @@ def main() -> None:
     plot_confusion_matrix(y_test, y_binary,  MODEL_DIR / "confusion_matrix.png")
     plot_pr_curve(y_test, y_prob,            MODEL_DIR / "pr_curve.png")
     plot_roc_curve(y_test, y_prob,           MODEL_DIR / "roc_curve.png")
-
-    # ── 7. SHAP background sample ─────────────────────────────────────────────
+    # 7. SHAP background sample
     rng = np.random.RandomState(RANDOM_STATE)
     bg  = X[rng.choice(X.shape[0], min(SHAP_BG_SIZE, X.shape[0]), replace=False)]
     np.save(SHAP_BACKGROUND_PATH, bg)
     print(f"SHAP background saved → {SHAP_BACKGROUND_PATH}")
-
-    # ── 8. Metadata ───────────────────────────────────────────────────────────
+    # 8. Metadata
     metadata = {
         "samples":           int(len(y)),
         "features":          int(X.shape[1]),
@@ -304,8 +262,7 @@ def main() -> None:
     with open(METADATA_PATH, "w") as f:
         json.dump(metadata, f, indent=4)
     print(f"Metadata saved → {METADATA_PATH}")
-
-    # ── 9. sklearn wrapper (for tools that expect sklearn API) ────────────────
+    # 9. sklearn wrapper (for tools that expect sklearn API)
     clf = XGBClassifier(
         **best_params,
         objective="binary:logistic",
@@ -316,9 +273,7 @@ def main() -> None:
     clf.fit(X_train, y_train)
     joblib.dump(clf, SKL_MODEL_PATH)
     print(f"sklearn wrapper saved → {SKL_MODEL_PATH}")
-
     print("\nTraining pipeline complete.")
-
 
 if __name__ == "__main__":
     main()

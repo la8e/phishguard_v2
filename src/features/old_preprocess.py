@@ -7,10 +7,9 @@ production single-email preprocessing.
 import os, re, sys, csv, math, time, email, html, hashlib, logging
 from pathlib import Path
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import cpu_count
+from multiprocessing import Pool, cpu_count
 from typing import Dict, Iterable, List, Optional
-# 3rdP
+# libraries
 import matplotlib
 matplotlib.use("Agg") # non-interactive backend; safe for servers
 import matplotlib.pyplot as plt
@@ -18,6 +17,8 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from email.utils import parseaddr
 from urllib.parse import urlparse
+from urlextract import URLExtract
+from tqdm import tqdm
 
 # Increase CSV field limit before pandas import
 _max_int = sys.maxsize
@@ -44,8 +45,7 @@ OUTPUT_FILE         = "phishguard_features.csv"
 EDA_DIR             = PROCESSED_DATA_PATH    / "eda"        # EDA artifacts path
 
 MAX_WORKERS   = max(1, cpu_count() - 1)
-CSV_CHUNKSIZE = 50_000          # larger chunks → fewer Python-level iterations
-PRINT_INTERVAL = 10_000         # log a progress line every N rows
+CSV_CHUNKSIZE = 5_000
 #  Label normalisation map
 LABEL_MAP: Dict[str, int] = {
     "spam": 1, "phish": 1, "phishing": 1, "1": 1, "yes": 1, "true": 1, "malicious": 1,
@@ -87,14 +87,8 @@ RETURN_PATH_RE  = re.compile(r"(?mi)^Return-Path:\s*<?([^>\r\n]+)>?")
 _SPF_FLAGS  = {"pass": 1, "fail": 0, "softfail": 0, "neutral": -1, "none": -1}
 _DKIM_FLAGS = {"pass": 1, "fail": 0, "neutral": -1, "none": -1}
 _DMARC_FLAGS= {"pass": 1, "fail": 0, "none": -1, "quarantine": 0, "reject": 0}
-# Singleton replaced: URL extraction now uses compiled regex (10-50x faster for bulk)
-# URLExtract is kept only for production_preprocessing (single-email path) where
-# accuracy matters more than throughput.
-try:
-    from urlextract import URLExtract as _URLExtract
-    _URL_EXTRACTOR = _URLExtract()
-except ImportError:
-    _URL_EXTRACTOR = None
+# Singleton URL extractor
+_URL_EXTRACTOR = URLExtract()
 
 # ........................................................................................
 # TEXT UTILITIES
@@ -105,14 +99,14 @@ def normalize(text: Optional[str]) -> str:
 def is_english(text: str) -> bool:
     """
     Heuristic: drop rows where fewer than 50% of letters are ASCII.
-    Avoids re.sub by filtering with str methods directly.
+    Handles mixed footers by checking the full body, not just a sample.
     """
     if not text or len(text) < 3:
         return False
-    letters = [c for c in text if c.isalpha()]
+    letters = re.sub(r"[\s\d\W]", "", text)
     if not letters:
         return True     # numeric/symbol-only content (e.g. invoice) - keep
-    return sum(c.isascii() for c in letters) / len(letters) > 0.5
+    return (sum(c.isascii() for c in letters) / len(letters)) > 0.5
 
 def clean_for_embeddings(text: str) -> str:
     """
@@ -164,22 +158,15 @@ def normalize_label(value) -> int:
 
 # ........................................................................................
 # URL & HEADER UTILITIES
-def safe_find_urls(text: str, use_extractor: bool = False) -> List[str]:
-    """
-    Extract URLs from text.
-    - use_extractor=False (default, training path): regex only — ~10-50x faster.
-    - use_extractor=True  (production path): URLExtract for higher recall on
-      obfuscated / bare-domain links, falls back to regex if unavailable.
-    """
+def safe_find_urls(text: str) -> List[str]:
+    """URLExtract wrapper; silently returns [] on any failure."""
     if not text:
         return []
-    if use_extractor and _URL_EXTRACTOR is not None:
-        try:
-            clean = text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
-            return _URL_EXTRACTOR.find_urls(clean) or []
-        except Exception:
-            pass
-    return URL_RE.findall(text)
+    try:
+        clean = text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+        return _URL_EXTRACTOR.find_urls(clean) or []
+    except Exception:
+        return []
 
 def _match_flag(pattern: re.Pattern, text: str, mapping: dict, default: int = -1) -> int:
     """Extract a single auth result token and map it to an integer."""
@@ -378,73 +365,42 @@ def parse_csv_row(row: Dict) -> Optional[Dict]:
     }
     headers_text = str(row.get("raw_headers") or row.get("headers") or "")
     auth_info    = parse_auth_from_headers(headers_text) if headers_text else {}
-    # Normalize string fields once; avoid double-call
-    text_fields = [(k, normalize(v)) for k, v in row.items() if isinstance(v, str)]
-    text_fields = [(k, v) for k, v in text_fields if v]   # drop empty after normalize
+    # Pick the longest string fields as body / subject (handles varied CSV schemas)
+    text_fields = {k: normalize(v) for k, v in row.items() if isinstance(v, str) and normalize(v)}
     if not text_fields:
         return None
-    text_fields.sort(key=lambda x: len(x[1]), reverse=True)
-    body    = text_fields[0][1]
-    subject = text_fields[1][1] if len(text_fields) > 1 else ""
+    sorted_fields = sorted(text_fields.items(), key=lambda x: len(x[1]), reverse=True)
+    body    = sorted_fields[0][1]
+    subject = sorted_fields[1][1] if len(sorted_fields) > 1 else ""
     sender  = normalize(row.get("from") or row.get("sender") or "")
-    urls    = safe_find_urls(body)              # fast regex path
+    urls    = safe_find_urls(body)
     return build_features(subject, body, sender, urls, 0, [], label, auth_info, header_fields)
 
 # ........................................................................................
 # DATA LOADING HELPERS
 def iter_csv_rows(path: str) -> Iterable[Dict]:
-    """
-    Yield CSV rows in chunks using the fast C engine.
-    The C engine supports on_bad_lines='skip' since pandas 1.3 and is
-    3-5x faster than engine='python' for large files.
-    """
+    """Yield CSV rows in chunks; skips bad lines and bad bytes silently."""
     try:
         for chunk in pd.read_csv(
-            path, dtype=str, engine="c", on_bad_lines="skip",
+            path, dtype=str, engine="python", on_bad_lines="skip",
             chunksize=CSV_CHUNKSIZE, encoding="utf-8", encoding_errors="ignore"):
-            yield from chunk.fillna("").to_dict(orient="records")
+            for record in chunk.fillna("").to_dict(orient="records"):
+                yield record
     except Exception as e:
         logger.error("Failed reading CSV %s: %s", path, e)
 
-def _progress(current: int, total: int, label: str, start: float) -> None:
-    """Print an in-place progress line via carriage return."""
-    elapsed = time.time() - start
-    rate    = current / elapsed if elapsed > 0 else 0
-    pct     = 100 * current / total if total else 0
-    sys.stderr.write(f"\r  {label}: {current:,}/{total:,}  ({pct:.1f}%)  {rate:,.0f} rows/s   ")
-    sys.stderr.flush()
-
 def process_emls(files: List[str]) -> List[Dict]:
-    """Parallel EML parsing; logs progress via in-place text lines."""
+    """Parallel EML parsing via multiprocessing pool."""
     if not files:
         return []
-    results: List[Dict] = []
-    start = time.time()
-    total = len(files)
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(parse_eml, f): f for f in files}
-        done = 0
-        for fut in as_completed(futures):
-            done += 1
-            r = fut.result()
-            if r is not None:
-                results.append(r)
-            if done % 100 == 0 or done == total:
-                _progress(done, total, "EMLs", start)
-    sys.stderr.write("\n")
-    return results
-
-def _process_chunk(chunk_records: List[Dict]) -> List[Dict]:
-    """Worker: parse a list of raw CSV row dicts → feature dicts. Runs in subprocess."""
-    out = []
-    for row in chunk_records:
-        try:
-            rec = parse_csv_row(row)
-            if rec is not None:
-                out.append(rec)
-        except Exception:
-            pass
-    return out
+    with Pool(MAX_WORKERS) as pool:
+        results = list(tqdm(
+            pool.imap(parse_eml, files),
+            total=len(files),
+            desc="Parsing EMLs",
+            unit="file",
+        ))
+    return [r for r in results if r is not None]
 
 def load_raw_data(raw_dir: str) -> pd.DataFrame:
     """Walk raw_dir, parse all EML and CSV files, return a combined DataFrame."""
@@ -459,43 +415,28 @@ def load_raw_data(raw_dir: str) -> pd.DataFrame:
                 csv_files.append(full)
 
     if eml_files:
-        logger.info("Parsing %d EML files …", len(eml_files))
+        logger.info("Parsing %d EML files in parallel…", len(eml_files))
         records.extend(process_emls(eml_files))
 
     for csv_path in csv_files:
         logger.info("Reading CSV: %s", csv_path)
-        # Count lines for progress display (fast: read in binary mode)
         try:
             file_rows = sum(1 for _ in open(csv_path, "rb")) - 1
         except Exception:
-            file_rows = 0
-
-        # Submit chunks to the process pool for parallel feature extraction
-        processed = 0
-        start = time.time()
-        name  = Path(csv_path).name
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = []
-            for chunk in pd.read_csv(
-                csv_path, dtype=str, engine="c", on_bad_lines="skip",
-                chunksize=CSV_CHUNKSIZE, encoding="utf-8", encoding_errors="ignore"
-            ):
-                chunk_list = chunk.fillna("").to_dict(orient="records")
-                futures.append(ex.submit(_process_chunk, chunk_list))
-
-            for fut in as_completed(futures):
-                batch = fut.result()
-                records.extend(batch)
-                processed += len(batch)
-                if file_rows:
-                    _progress(processed, file_rows, name, start)
-                else:
-                    elapsed = time.time() - start
-                    rate = processed / elapsed if elapsed > 0 else 0
-                    sys.stderr.write(f"\r  {name}: {processed:,} rows  {rate:,.0f} rows/s   ")
-                    sys.stderr.flush()
-        sys.stderr.write("\n")
-
+            file_rows = None # fall back to counter
+        for row in tqdm(
+            iter_csv_rows(csv_path),
+            total=file_rows,
+            desc=Path(csv_path).name,
+            unit="row",
+            miniters=1000, # refresh rate
+        ):
+            try:
+                rec = parse_csv_row(row)
+                if rec is not None:
+                    records.append(rec)
+            except Exception:
+                continue
     return pd.DataFrame(records)
 
 # ........................................................................................
@@ -642,7 +583,7 @@ def production_preprocessing(raw_email: str) -> Optional[Dict]:
     body_parts, html_present, attachments, html_urls = _walk_mime(msg)
     body = normalize(" ".join(body_parts))
     # Merge URLExtract hits with explicit anchor hrefs (catches obfuscated links)
-    urls = list(set(safe_find_urls(body, use_extractor=True) + html_urls))
+    urls = list(set(safe_find_urls(body) + html_urls))
     headers_text = "\n".join(f"{k}: {v}" for k, v in msg.items())
     auth_info    = parse_auth_from_headers(headers_text)
     features = build_features(

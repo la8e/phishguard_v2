@@ -1,264 +1,288 @@
-
-#!/usr/bin/env python3
 """
-Feature pipeline for phishing detection.
+PhishGuard: Feature Concatenation Pipeline (feature_concat.py)
 
-Training mode (--mode train):
-    - Align embeddings with dataset, extract manual features, scale, and save.
+Training mode  (--mode train):
+  Align embeddings with the CSV, compute manual security features,
+  fit a StandardScaler, concatenate, and save everything.
 
-Production mode (Imported OR --mode prod):
-    - Load schema + scaler into memory.
-    - Accept embedding array + manual feature dict directly from other modules.
-    - Produce model-ready vector.
+Production mode (imported):
+  FeatureBuilder loads schema + scaler once and produces the
+  314-dimensional model-input vector on demand.
 """
+import argparse, json, logging
+from email.utils import parseaddr
+from pathlib import Path
+from typing import Any, Dict
 
-import os # for file paths
-import sys # system exit
-import json # save/ load feature schema
-import logging 
-import argparse
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import joblib # save/ load scikit-learn scaler
-from concurrent.futures import ThreadPoolExecutor
-from sklearn.preprocessing import StandardScaler # standardise manual features (zero mean, unit variance).
-from pathlib import Path
-from email.utils import parseaddr # safely extract email address from "Name <email>" format.
-from typing import Dict, Any, Union
+from sklearn.preprocessing import StandardScaler
 
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("feature_pipeline")
+logger = logging.getLogger("feature_concat")
 
-# ================= CONFIG =================
-# Resolving absolute paths ensures it works no matter where the script is imported from
+# ............................................................................
+# PATHS
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data/processed/embed_output"
-MODEL_DIR = PROJECT_ROOT / "models"
+DATA_DIR     = PROJECT_ROOT / "data" / "processed" / "embed_output"
+MODEL_DIR    = PROJECT_ROOT / "models"
+EDA_DIR      = PROJECT_ROOT / "data" / "processed" / "eda"
 
-CSV_PATH = DATA_DIR / "../phishguard_features.csv"
-EMBED_PATH = DATA_DIR / "X_embeddings.npy"
-LABEL_PATH = DATA_DIR / "y_labels.npy"
-
+CSV_PATH    = DATA_DIR.parent / "phishguard_features.csv"
+EMBED_PATH  = DATA_DIR / "X_embeddings.npy"
+LABEL_PATH  = DATA_DIR / "y_labels.npy"
+OUTPUT_PATH = DATA_DIR / "xgboost_features.npz"
 SCHEMA_PATH = MODEL_DIR / "feature_schema.json"
 SCALER_PATH = MODEL_DIR / "manual_scaler.pkl"
-OUTPUT_PATH = DATA_DIR / "xgboost_features.npz"
 
-# ================= FEATURE DEFINITIONS =================
+# ............................................................................
+# FEATURE DEFINITIONS (order is fixed - do not reorder)
 NUMERIC_BASE = [
-    "urgent_words_count",
-    "digit_ratio",
-    "body_entropy",
-    "html_present",
-    "auth_headers_present",
-    "spf_result",
-    "dkim_result",
-    "dmarc_result",
-    "received_count",
+    "urgent_words_count", "digit_ratio", "body_entropy",
+    "html_present", "auth_headers_present",
+    "spf_result", "dkim_result", "dmarc_result", "received_count",
 ]
+COUNT_FEATURES = ["urls_count", "domains_count", "ip_urls_count", "attachment_names_count",]
+HEADER_FEATURES = ["return_path_mismatch"]
+MANUAL_FEATURES = NUMERIC_BASE + COUNT_FEATURES + HEADER_FEATURES  # 14 total
 
-COUNT_FEATURES = [
-    "urls_count",
-    "domains_count",
-    "ip_urls_count",
-    "attachment_names_count",
-]
-
-HEADER_FEATURES = [
-    "return_path_mismatch"
-]
-
-MANUAL_FEATURES = NUMERIC_BASE + COUNT_FEATURES + HEADER_FEATURES
-
-# ================= HEADER UTILS =================
+# ............................................................................
+# UTILITY (used in both training and production)
 def extract_domain(email_string: str) -> str:
+    """Parse the domain from an RFC-5321 address string; returns '' on failure."""
     if not isinstance(email_string, str) or not email_string:
         return ""
-    _, addr = parseaddr(email_string) # returns real name and email address
-    if "@" in addr:
-        return addr.split("@")[-1].lower() # get domain after @ and lowercase
-    return "" # if not valid email returns empty string
+    _, addr = parseaddr(email_string)
+    return addr.split("@")[-1].lower() if "@" in addr else ""
 
-def return_path_mismatch(row: pd.Series) -> int:
-    # Use from_header, fallback to sender if needed
-    sender = extract_domain(row.get("from_header", row.get("sender", "")))
-    return_path = extract_domain(row.get("return_path", ""))
-
-    if sender and return_path and sender != return_path:
-        return 1 # if both exists and differ
-    return 0
-
-# ================= PARALLEL FEATURE EXTRACTION =================
+# ............................................................................
+# TRAINING:  manual feature extraction from DataFrame
 def extract_manual_features(df: pd.DataFrame) -> np.ndarray:
-    logger.info("Vectorized feature extraction...")
-
+    """
+    Vectorised extraction of all 14 manual security features from a DataFrame.
+    Missing columns are zeroed rather than raising.
+    Returns a float32 array of shape (N, 14).
+    """
+    # Ensure expected columns exist with numeric types & correct defaults
+    _FILL_DEFAULTS = {
+        "urgent_words_count":     0,
+        "digit_ratio":            0.0,
+        "body_entropy":           0.0,
+        "html_present":           0,
+        "auth_headers_present":   0,
+        "spf_result":            -1, # -1 = absent, not fail
+        "dkim_result":           -1,
+        "dmarc_result":          -1,
+        "received_count":         0,
+        "urls_count":             0,
+        "domains_count":          0,
+        "ip_urls_count":          0,
+        "attachment_names_count": 0
+    }
     for col in NUMERIC_BASE + COUNT_FEATURES:
         if col not in df.columns:
-            df[col] = 0 # fill missing columns with 0
+            df[col] = _FILL_DEFAULTS.get(col, 0)
+    df[NUMERIC_BASE + COUNT_FEATURES] = (
+        df[NUMERIC_BASE + COUNT_FEATURES]
+        .apply(pd.to_numeric, errors="coerce")
+            .fillna(pd.Series(_FILL_DEFAULTS))
+    )
 
-    df[NUMERIC_BASE + COUNT_FEATURES] = df[NUMERIC_BASE + COUNT_FEATURES].apply(
-        pd.to_numeric, errors="coerce"
-    ).fillna(0) # Converts them to numeric (coerce errors to NaN) then fill NaN with 0.replace not number values with NaN then convert NaN -> O 
-# instead of replacing with zero let the model to handle it 
-    # Vectorized return_path mismatch
-    # Checking both 'from_header' and 'sender' to ensure robustness
-    sender_col = df["from_header"] if "from_header" in df.columns else df.get("sender", pd.Series([""]*len(df)))
-    sender_domains = sender_col.apply(extract_domain)
-    return_domains = df.get("return_path", pd.Series([""]*len(df))).apply(extract_domain)
-# safety net to prevent code from crash, handle by assigning missing values instead of crashing the code. 
+    # Vectorised return-path mismatch (avoids a slow row-by-row apply)
+    sender_col   = df.get("from_header", df.get("sender", pd.Series([""] * len(df))))
+    sender_doms  = sender_col.apply(extract_domain)
+    return_doms  = df.get("return_path", pd.Series([""] * len(df))).apply(extract_domain)
     df["return_path_mismatch"] = (
-        (sender_domains != "") &
-        (return_domains != "") & # change it to use apply() 
-        (sender_domains != return_domains)
-    ).astype(int) # creates boolean mask where both domains are non‑empty and different, then casts to int.
+        (sender_doms != "") & (return_doms != "") & (sender_doms != return_doms)
+    ).astype(int)
     return df[MANUAL_FEATURES].values.astype(np.float32)
-    # return 2d numpy array as float32
-# ================= TRAINING PIPELINE =================
-def train_pipeline():
-    MODEL_DIR.mkdir(exist_ok=True, parents=True)
-    DATA_DIR.mkdir(exist_ok=True, parents=True)
-    # creat directories, with intermediate ones (parents=true)
-    logger.info("Loading dataset...")
-    df = pd.read_csv(CSV_PATH, dtype=str).fillna("") # read columns as string
 
-    logger.info("Loading labels...")
-    y = np.load(LABEL_PATH).astype(int) # load labels and embeddings from .npy files
+# ............................................................................
+# EDA - feature-matrix visualisations
+def _save(fig: plt.Figure, path: Path) -> None:
+    fig.savefig(path, bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    logger.info("Saved plot → %s", path)
 
-    logger.info("Loading embeddings...")
+def save_feature_eda(X_manual: np.ndarray, y: np.ndarray, eda_dir: str) -> None:
+    """
+    Persist feature-level EDA artifacts:
+      eda/feature_correlation.png    - heatmap of pairwise Pearson r between manual features
+      eda/feature_boxplots.png       - per-feature box-plots split by label (0 vs 1)
+      eda/feature_means_by_label.csv - mean value per feature per label class
+    """
+    eda_path = Path(eda_dir)
+    eda_path.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(X_manual, columns=MANUAL_FEATURES)
+    df["label"] = y
+    # 1. Correlation heatmap 
+    corr = df[MANUAL_FEATURES].corr()
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(MANUAL_FEATURES)))
+    ax.set_yticks(range(len(MANUAL_FEATURES)))
+    ax.set_xticklabels(MANUAL_FEATURES, rotation=45, ha="right", fontsize=7)
+    ax.set_yticklabels(MANUAL_FEATURES, fontsize=7)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title("Manual Feature Correlation (Pearson)")
+    _save(fig, eda_path / "feature_correlation.png")
+    # 2. Box-plots by label 
+    labeled = df[df["label"].isin([0, 1])]
+    n = len(MANUAL_FEATURES)
+    cols = 3
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3))
+    axes = axes.flatten()
+    for i, feat in enumerate(MANUAL_FEATURES):
+        data0 = labeled.loc[labeled["label"] == 0, feat]
+        data1 = labeled.loc[labeled["label"] == 1, feat]
+        axes[i].boxplot([data0, data1], labels=["Legit", "Phish"],
+                        patch_artist=True,
+                        boxprops=dict(facecolor="#b3e5fc"))
+        axes[i].set_title(feat, fontsize=8)
+    for j in range(i + 1, len(axes)):
+        axes[j].set_visible(False)
+    fig.suptitle("Feature Distributions by Label", y=1.01)
+    fig.tight_layout()
+    _save(fig, eda_path / "feature_boxplots.png")
+    # 3. Mean value per feature per label 
+    means = labeled.groupby("label")[MANUAL_FEATURES].mean()
+    means.to_csv(eda_path / "feature_means_by_label.csv")
+    logger.info("Feature means by label saved.")
+
+# ............................................................................
+# TRAINING PIPELINE
+def train_pipeline() -> None:
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True,  exist_ok=True)
+    EDA_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Loading CSV …")
+    df = pd.read_csv(CSV_PATH, dtype=str).fillna("")
+
+    logger.info("Loading embeddings and labels …")
     embeddings = np.load(EMBED_PATH)
+    y          = np.load(LABEL_PATH).astype(int)
 
-    # truncates all arrays to the smallest length (safety against mismatched rows)
-    min_len = min(len(df), len(embeddings), len(y))
-    df = df.iloc[:min_len]
-    embeddings = embeddings[:min_len]
-    y = y[:min_len]
-    
-    logger.info("Removing unlabeled rows (-1)...")
-    mask = y != -1 # check every single value in y array not equal to -1. return new array of true and false values
-    df = df.loc[mask].reset_index(drop=True) # renumbers rows consecutively
+    # Align all three sources to the shortest length
+    n = min(len(df), len(embeddings), len(y))
+    df, embeddings, y = df.iloc[:n], embeddings[:n], y[:n]
+
+    # Drop unlabelled rows
+    mask       = y != -1
+    df         = df.loc[mask].reset_index(drop=True)
     embeddings = embeddings[mask]
-    y = y[mask] # just keep the True values of mask which their label not -1 and drop other rows
-
-    logger.info(f"Remaining labeled samples: {len(y)}")
+    y          = y[mask]
+    logger.info("Labelled samples after filtering: %d", len(y))
     if len(y) == 0:
-        raise ValueError("No labeled samples found after filtering")
-        
-    logger.info("Extracting manual features...")
-    X_manual = extract_manual_features(df)
-    
+        raise ValueError("No labelled samples found - cannot train.")
+
+    # Label distribution
     unique, counts = np.unique(y, return_counts=True)
-    logger.info(f"Label distribution: {dict(zip(unique, counts))}")
-    
-    logger.info("Scaling manual features...")
-    scaler = StandardScaler() # standerises manual features 
-    X_manual = scaler.fit_transform(X_manual) # standarise the large values to smaller ones so that the model don't lose calculations
+    logger.info("Label distribution: %s", dict(zip(unique.tolist(), counts.tolist())))
+    logger.info("Extracting manual features …")
+    X_manual = extract_manual_features(df)
+
+    # feature EDA ------------------------------
+    save_feature_eda(X_manual, y, str(EDA_DIR))
+
+    logger.info("Fitting StandardScaler …")
+    scaler   = StandardScaler()
+    X_manual = scaler.fit_transform(X_manual)
     joblib.dump(scaler, SCALER_PATH)
+    logger.info("Scaler saved → %s", SCALER_PATH)
 
-    logger.info("Stacking embeddings...")
-    X_emb = embeddings.astype(np.float32)
+    logger.info("Concatenating embeddings + manual features …")
+    X = np.hstack([embeddings.astype(np.float32), X_manual]).astype(np.float32)
 
-    logger.info("Concatenating features...")
-    X = np.hstack([X_emb, X_manual]).astype(np.float32)
-    # horizontally stacks embeddings and manual features side by side 
-    logger.info("Saving training features...")
-    np.savez_compressed(OUTPUT_PATH, =, y=y)
-    # saves combined features and labels in compressed .npz
+    np.savez_compressed(OUTPUT_PATH, X=X, y=y)
+    logger.info("Feature matrix saved → %s  shape=%s", OUTPUT_PATH, X.shape)
+    # Save schema (feature names + ordering)
     schema = {
-        "embedding_dim": X_emb.shape[1],
+        "embedding_dim":   int(embeddings.shape[1]),
         "manual_features": MANUAL_FEATURES,
-        "feature_order": [f"emb_{i}" for i in range(X_emb.shape[1])] + MANUAL_FEATURES
+        "feature_order":   [f"emb_{i}" for i in range(embeddings.shape[1])] + MANUAL_FEATURES,
     }
-
     with open(SCHEMA_PATH, "w") as f:
         json.dump(schema, f, indent=4)
-# saves json schema with embeddings, manual features, and features order to use in production and ensure sonsistent ordering
-    logger.info("Training pipeline completed.")
-    logger.info(f"Feature matrix shape: {X.shape}")
+    logger.info("Schema saved → %s", SCHEMA_PATH)
+    logger.info("Training pipeline complete. Final shape: %s", X.shape)
 
-# ================= PRODUCTION FEATURE BUILDER =================
+# ............................................................................
+# PRODUCTION - FeatureBuilder class
 class FeatureBuilder:
     """
-    Import this class into your main pipeline module.
-    It loads the schema/scaler ONCE upon initialization.
+    Loads schema and scaler once at startup.
+    Call build_vector(embedding, manual_dict) per email during inference.
     """
     def __init__(self):
         if not SCHEMA_PATH.exists() or not SCALER_PATH.exists():
-            raise FileNotFoundError("Schema or Scaler not found. Run --mode train first.")
-# loads schema and scaler once the object is created, raise error if not trained
+            raise FileNotFoundError(
+                f"Schema or scaler not found in {MODEL_DIR}. Run --mode train first."
+            )
         with open(SCHEMA_PATH) as f:
             schema = json.load(f)
-
-        self.embedding_dim = schema["embedding_dim"]
+        self.embedding_dim   = schema["embedding_dim"]
         self.manual_features = schema["manual_features"]
-        self.scaler = joblib.load(SCALER_PATH)
-        logger.info("FeatureBuilder initialized in Production Mode.")
+        self.scaler          = joblib.load(SCALER_PATH)
+        logger.info("FeatureBuilder ready (embedding_dim=%d).", self.embedding_dim)
 
     def build_vector(self, embedding_vector: np.ndarray, manual_dict: Dict[str, Any]) -> np.ndarray:
         """
-        Takes the FastText array and the Preprocessed dictionary, 
-        returns the finalized 1D Numpy array for XGBoost.
+        Combine a FastText embedding with the manual feature dict into the
+        final 314-dim input vector expected by XGBoost.
+        Steps:
+          1. Compute return_path_mismatch from from_header / return_path.
+          2. Extract features in schema order.
+          3. Scale with the fitted StandardScaler.
+          4. Hstack [embedding | scaled_manual] and return as float32.
         """
         if len(embedding_vector) != self.embedding_dim:
-            raise ValueError(f"Embedding dimension mismatch. Expected {self.embedding_dim}, got {len(embedding_vector)}") 
-        # validate embedding dimension
-        # Compute mismatch dynamically
-        sender = manual_dict.get("from_header", manual_dict.get("sender", ""))
+            raise ValueError(
+                f"Embedding dim mismatch: expected {self.embedding_dim}, got {len(embedding_vector)}"
+            )
+        # Recompute mismatch at inference time (not stored in the dict reliably)
+        sender   = manual_dict.get("from_header", manual_dict.get("sender", ""))
         ret_path = manual_dict.get("return_path", "")
-        
-        manual_dict["return_path_mismatch"] = (
-            1 if extract_domain(sender) != extract_domain(ret_path) else 0
+        manual_dict["return_path_mismatch"] = int(
+            bool(extract_domain(sender) and extract_domain(ret_path)
+                 and extract_domain(sender) != extract_domain(ret_path))
         )
 
-        # Extract features in exact order as schema
-        manual_values = []
-        for feat in self.manual_features:
-            val = float(manual_dict.get(feat, 0.0))
-            manual_values.append(val)
+        manual_values = np.array(
+            [float(manual_dict.get(f, 0.0)) for f in self.manual_features],
+            dtype=np.float32,
+        ).reshape(1, -1)
 
-        # Reshape for scaler (1 sample, n features)
-        manual_array = np.array(manual_values).reshape(1, -1) # convert the python list from 1D array to 2D array based on the features numbers that (-1) would find out the exact number of features in this case it will result in (1,14)
-        scaled_manual = self.scaler.transform(manual_array) # apply the same scaling
+        scaled = self.scaler.transform(manual_values)
+        return np.hstack([embedding_vector.reshape(1, -1), scaled]).astype(np.float32)
 
-        # Concatenate: [Embeddings, Scaled Manual Features]
-        vector = np.hstack([embedding_vector.reshape(1, -1), scaled_manual])
-        # reshapes embedding to (1, dim), stacks horizontally, returns a 2D array (samples × features).
-        return vector.astype(np.float32)
-
-# ================= CLI =================
+# ............................................................................
+# CLI
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PhishGuard Feature Pipeline")
-    parser.add_argument("--mode", choices=["train", "prod"], required=True, 
-                        help="train: builds scaler/schema. prod: runs a self-test.")
+    parser.add_argument(
+        "--mode", choices=["train", "prod"], required=True,
+        help="train: build scaler/schema  |  prod: run self-test",
+    )
     args = parser.parse_args()
-
     if args.mode == "train":
         train_pipeline()
-
-    elif args.mode == "prod":
-        logger.info("Running Production Self-Test...")
+    else:
+        logger.info("Production self-test …")
         builder = FeatureBuilder()
-
-        # Dummy data simulating what the Orchestrator will pass
-        fake_embedding = np.random.rand(builder.embedding_dim)
-        fake_manual = {
-            "urgent_words_count": 2,
-            "digit_ratio": 0.1,
-            "body_entropy": 4.2,
-            "html_present": 1,
-            "auth_headers_present": 1,
-            "spf_result": 1,
-            "dkim_result": 1,
-            "dmarc_result": 0,
-            "received_count": 5,
-            "urls_count": 2,
-            "domains_count": 1,
-            "ip_urls_count": 0,
-            "attachment_names_count": 1,
-            "sender": "attacker@evil.com",
-            "return_path": "support@bank.com"
+        fake_emb = np.random.rand(builder.embedding_dim).astype(np.float32)
+        fake_manual: Dict[str, Any] = {
+            "urgent_words_count": 3, "digit_ratio": 0.12, "body_entropy": 4.5,
+            "html_present": 1, "auth_headers_present": 0, "spf_result": -1,
+            "dkim_result": -1, "dmarc_result": -1, "received_count": 8,
+            "urls_count": 5, "domains_count": 3, "ip_urls_count": 1,
+            "attachment_names_count": 0,
+            "from_header": "security@evil.com", "return_path": "noreply@bank.com",
         }
-
-        final_vector = builder.build_vector(fake_embedding, fake_manual)
-        print("\nSUCCESS!\n ")
-        print(f"Input Embedding Dim : {len(fake_embedding)}")
-        print(f"Input Manual Feats  : {len(fake_manual)}")
-        print(f"Output Vector Shape : {final_vector.shape}")
+        vec = builder.build_vector(fake_emb, fake_manual)
+        print(f"\nSUCCESS - output shape: {vec.shape}")

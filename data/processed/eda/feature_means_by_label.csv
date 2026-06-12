@@ -1,0 +1,3 @@
+label,urgent_words_count,digit_ratio,body_entropy,html_present,auth_headers_present,spf_result,dkim_result,dmarc_result,received_count,urls_count,domains_count,ip_urls_count,attachment_names_count,return_path_mismatch
+0,1.2916136,0.077833675,5.0734925,0.0,0.0,-1.0,-1.0,-1.0,0.0,4.5497136,1.1707513,0.008123678,0.0,0.0
+1,1.0971673,0.09345713,5.249377,0.0,0.0,-1.0,-1.0,-1.0,0.0,3.7266395,1.418531,0.04124117,0.0,0.0

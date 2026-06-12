@@ -1,0 +1,74 @@
+services:
+
+  # ── Lightweight: fast triage, no SHAP, no VirusTotal ────────────────────────
+  phishguard-lite:
+    build:
+      context: .
+      dockerfile: Dockerfile.lite
+    image: phishguard:lite
+    container_name: phishguard-lite
+    profiles: [lite]
+    stdin_open: true      # keeps the interactive input loop alive
+    tty: true
+    volumes:
+      # Trained model artifacts
+      - ./models:/app/models:ro
+      # FastText binary (7.2G — always external, never in image)
+      - ./src/features/fastText:/app/src/features/fastText:ro
+      # JSONL log output
+      - ./logs:/app/logs:rw
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # ── Full: SHAP explainability + VirusTotal reputation enrichment ─────────────
+  phishguard-full:
+    build:
+      context: .
+      dockerfile: Dockerfile.full
+    image: phishguard:full
+    container_name: phishguard-full
+    profiles: [full]
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./models:/app/models:ro
+      - ./src/features/fastText:/app/src/features/fastText:ro
+      - ./logs:/app/logs:rw
+    environment:
+      - PYTHONUNBUFFERED=1
+      - VT_API_KEY=${VT_API_KEY:-}
+
+  # ── Standalone: artifacts baked in, only FastText mounted ────────────────────
+  phishguard-standalone:
+    build:
+      context: .
+      dockerfile: Dockerfile.standalone
+    image: phishguard:standalone
+    container_name: phishguard-standalone
+    profiles: [standalone]
+    stdin_open: true
+    tty: true
+    volumes:
+      # Only FastText and logs need mounting — everything else is in the image
+      - ./src/features/fastText:/app/src/features/fastText:ro
+      - ./logs:/app/logs:rw
+    environment:
+      - PYTHONUNBUFFERED=1
+      - VT_API_KEY=${VT_API_KEY:-}
+
+  # ── Self-contained: zero mounts, fully portable (image ~8-9G) ────────────────
+  phishguard-selfcontained:
+    build:
+      context: .
+      dockerfile: Dockerfile.selfcontained
+    image: phishguard:selfcontained
+    container_name: phishguard-selfcontained
+    profiles: [selfcontained]
+    stdin_open: true
+    tty: true
+    volumes:
+      # Only logs need to persist on the host
+      - ./logs:/app/logs:rw
+    environment:
+      - PYTHONUNBUFFERED=1
+      - VT_API_KEY=${VT_API_KEY:-}

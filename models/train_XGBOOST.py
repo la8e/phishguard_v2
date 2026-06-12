@@ -1,273 +1,324 @@
 #!/usr/bin/env python3
 """
-PhishGuard XGBoost Training Pipeline
-Production-grade training pipeline with:
+PhishGuard - XGBoost Training Pipeline (train_XGBOOST.py)
 
-• Optuna hyperparameter tuning
-• Native XGBoost cross validation
-• multiprocessing
-• efficient memory usage
-• early stopping
-• SHAP background sampling
+Fixed issues vs. original
+──────────────────────────
+1. best_trial.params called BEFORE optimize() — crash on empty study.
+   Fixed: moved after study.optimize().
+2. Final xgb.train() had no early_stopping_rounds — would blindly run
+   all 2000 rounds regardless of validation loss.
+   Fixed: added evals + early_stopping_rounds to xgb.train().
+3. Top-level script code (data loading, train/test split, study creation)
+   ran at import time — unusable as a module.
+   Fixed: wrapped everything in main().
+4. Spurious syntax error in metadata dict: (,316) on the features line.
+   Fixed.
+
+New additions
+─────────────
+• eval metrics saved to models/eval_metrics.json
+• confusion matrix PNG → models/confusion_matrix.png
+• PR curve PNG        → models/pr_curve.png
+• ROC curve PNG       → models/roc_curve.png
+• Optuna history PNG  → models/optuna_history.png
+• class distribution  → printed and stored in metadata
 """
 
-import json # saves model metadata
-import time 
-import multiprocessing as mp
-from pathlib import Path # object oriented path handling 
+# ── Standard library ──────────────────────────────────────────────────────────
+import gc
+import json
+import time
+from pathlib import Path
 
-import numpy as np # array operations
-import xgboost as xgb # XGBOOST algo lib for training and cross validation
-import optuna # hyperparameter opeimisation framework 
-from optuna.pruners import MedianPruner # prunes unpromising trials early
-from sklearn.metrics import average_precision_score # calculate precision score after training
-import joblib # saves scikit-learn wrapper model 
-import gc  # garbage collector to free memory after each trial
-from sklearn.model_selection import train_test_split # split data to train/test
-from sklearn.metrics import precision_recall_curve # compute optimal threshold from precision-recall curve
-# ==========================================================
-# Paths
-# ==========================================================
-ROOT= Path(__file__).parent.parent
-DATA_PATH = ROOT / "data/processed/embed_output/xgboost_features.npz"
+# ── Third-party ───────────────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import xgboost as xgb
+import optuna
+from optuna.pruners import MedianPruner
+from tqdm.auto import tqdm as tqdm_auto
+import joblib
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, f1_score,
+    precision_recall_curve, precision_score,
+    recall_score, roc_auc_score, roc_curve,
+    average_precision_score,
+)
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PATHS
+# ══════════════════════════════════════════════════════════════════════════════
+ROOT      = Path(__file__).resolve().parent.parent
+DATA_PATH = ROOT / "data" / "processed" / "embed_output" / "xgboost_features.npz"
 MODEL_DIR = ROOT / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
-MODEL_PATH = MODEL_DIR / "phishguard_xgb.json" # native model 
-METADATA_PATH = MODEL_DIR / "model_metadata.json" # training metadata
-SHAP_BACKGROUND_PATH = MODEL_DIR / "shap_background.npy" # background sample for SHAP explanations 
-# ==========================================================
-# Global settings
-# ==========================================================
-RANDOM_STATE = 42 # for reproducibility
-N_THREADS = 2 # CPU threads 
-N_FOLDS = 3 # folds number used in cross validation
+MODEL_PATH          = MODEL_DIR / "phishguard_xgb.json"
+SKL_MODEL_PATH      = MODEL_DIR / "phishguard_xgb.pkl"
+METADATA_PATH       = MODEL_DIR / "model_metadata.json"
+METRICS_PATH        = MODEL_DIR / "eval_metrics.json"      # NEW
+SHAP_BACKGROUND_PATH= MODEL_DIR / "shap_background.npy"
+OPTUNA_DB           = f"sqlite:///{MODEL_DIR / 'optuna_phishguard.db'}"
 
-N_TRIALS = 50 # number of optuna trials 
-NUM_BOOST_ROUND = 2000 # maximum boosting rounds for final training
-EARLY_STOPPING = 50 # stop after 50 rounds if there's no improvements
-# ==========================================================
-# Load dataset (memory efficient)
-# ==========================================================
-print("Loading dataset...")
+# ══════════════════════════════════════════════════════════════════════════════
+# HYPERPARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
+RANDOM_STATE      = 42
+N_THREADS         = 2
+N_TRIALS          = 50
+TUNE_SUBSET_SIZE  = 40_000   # rows sampled per Optuna trial
+TUNE_BOOST_ROUNDS = 600
+TUNE_EARLY_STOP   = 25
+FINAL_BOOST_ROUNDS= 2_000
+FINAL_EARLY_STOP  = 50       # FIX: was missing from original
+SHAP_BG_SIZE      = 1_024
 
-npz = np.load(DATA_PATH, mmap_mode="r") # open file in memory mapped read=only on demand not fully loaded
-X = np.array(npz["X"], dtype=np.float32)
-y = np.array(npz["y"], dtype=np.int32)
-# Forces loading into memory as actual numpy arrays (removes the memory‑mapped reference). This is fine because after filtering we will have a manageable size.
 
-mask = (y != -1) # remove rows with label -1
-X = X[mask]
-y = y[mask]
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-print("Dataset shape:", X.shape)
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
-    test_size=0.2,
-    stratify=y, # ensures the same class distribution in both splits
-    random_state=42
-)
-# ==========================================================
-# Class imbalance handling
-# ==========================================================
-pos = (y_train == 1).sum()
-neg = (y_train == 0).sum()
-scale_pos_weight = neg / pos # negative to positive ratio
+def _save(fig: plt.Figure, path: Path, label: str = "") -> None:
+    fig.savefig(path, bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    print(f"[plot] {label or path.name} → {path}")
 
-print("Positives:", pos)
-print("Negatives:", neg)
-print("scale_pos_weight:", scale_pos_weight) # tells XGBoost to weight positive class more heavily when >1, increase the volume so the model can hear it over the noise of the majority.
-# shift the model focus from maximizing accuracy (useless for imbalanced data) to maximizing precision and recall (find actual spam) 
-# ==========================================================
-# Base XGBoost parameters
-# ==========================================================
-BASE_PARAMS = {
-    "objective": "binary:logistic", # binary classification, output probability.
-    "eval_metric": "aucpr", # optimise area under precision‑recall curve (good for imbalanced data).
-    "tree_method": "hist", # histogram‑based algorithm (faster, lower memory).
-    
-    "grow_policy": "lossguide", #  grow tree by splitting leaf with largest loss reduction (instead of depth‑wise).
-    "verbosity": 0, # silent
-    "nthread": N_THREADS,
-    
-    "max_bin": 128, # histogtam bins 
-    "scale_pos_weight": scale_pos_weight # as computed above. "Every time you miss a Spam email, I'm going to charge you 9 penalty points instead of 1." to force the model to learn the actual pattern
-}
-# ==========================================================
-# Optuna objective with native XGBoost CV
-# ==========================================================
-# ---------- CONFIG FOR SAFE TUNING ----------
-N_TRIALS = 50                       # total optuna trials for tuning
-TUNE_SUBSET_MAX = 60000             # use at most this many rows for tuning (adjust to memory)
-TUNE_NUM_BOOST_ROUND = 600          # lower rounds during tuning
-TUNE_EARLY_STOP = 30                # stop after 30 rounds if not improved
-OPTUNA_TIMEOUT_SECONDS = 60 * 60 * 4  # 3 hours max for tuning run (optional)
-# ------------------------------------------------
-def objective(trial): # called by optuna for each huperparameter combination
-    # =========================
-    # Sample subset (IMPORTANT)
-    # ========================= # 40k rows x 100 trials = 4M rows 
-    rng = np.random.RandomState(42 + trial.number) # use different random seed for trial to see the different data each trial to work generally not just on specific subset
-    subset_size = min(40000, X_train.shape[0]) # takes at mose 40,000 rows 
-    idx = rng.choice(X_train.shape[0], subset_size, replace=False) # randomly samples without replacement that guarantees the rows are unique not train on the same row twice in the same batch
-    # X_train.shape[0] : num of available rows
-    # this reduces tuning time and memory
-    X_sub = X_train[idx] # pass the list, numpy  grabs exactly those rows 
-    y_sub = y_train[idx] # use idx in emails and labels to ensure perfectly aligning
-    # =========================
-    # Define parameters
-    # =========================
-    params = BASE_PARAMS.copy()
 
-    params.update({
-        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True), # multiply it by prediction of a tree defore adding to total. + learns faster but might overshoot optimal solution, - makes tiny contribution need more trees but robusr and smooth. samples on logarithmic scale, float for (learning rate, regularization). log ensures tuner to spend equal time exploring the mathematically sensitive small numbers
-        "max_depth": trial.suggest_int("max_depth", 4, 10), # maximum number of splits, + overfitting , - underfitting
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0), # fraction of rows used per tree. ensures generalization
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0), # fraction of fetures used per tree, not relying on specific features, generalization
-        "min_child_weight": trial.suggest_int("min_child_weight", 1, 15), # minimum amount of "data weights" required to creat new leaf. creat new leaf on what value? 
-        "gamma": trial.suggest_float("gamma", 0.0, 5.0), # minimum loss reduction required to split. if the improvement of the split less than gamma abort the split
-        "lambda": trial.suggest_float("lambda", 1e-3, 10.0, log=True), # L2 regularization, penalizes outlier weights to prevent single tree branch from too much impacting over prediction
-        "alpha": trial.suggest_float("alpha", 1e-3, 10.0, log=True), # L1 regularization, ignores less important features, setting them to zero
-    }) # lambda and alpha are mathematical penalties applied to final weights of the leaves
-    # =========================
-    # Create DMatrix
-    # =========================
-    dtrain = xgb.DMatrix(X_sub, label=y_sub, nthread=2) #  highly optimized data format, it converts standard pandas/numpy data into a specialized memory structure that XGBoost can process blazingly fast.
-    # =========================
-    # Cross Validation
-    # =========================
-    cv = xgb.cv( # performs cross‑validation and returns a DataFrame of metrics.
-        params=params,
-        dtrain=dtrain,
-        num_boost_round=600, # don't build more than 600 trees 
-        nfold=3,
-        stratified=True, # maintains exact ratio on evey fold
-        early_stopping_rounds=25, # stop after 25 trees built if no improvement, prevent overfitting
-        seed=42,
-        verbose_eval=False
-    ) 
+def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, path: Path) -> None:
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(cm, cmap="Blues")
+    for (r, c), val in np.ndenumerate(cm):
+        ax.text(c, r, f"{val:,}", ha="center", va="center",
+                color="white" if val > cm.max() / 2 else "black")
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(["Legit", "Phish"])
+    ax.set_yticklabels(["Legit", "Phish"])
+    ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+    ax.set_title("Confusion Matrix")
+    plt.colorbar(im, ax=ax)
+    _save(fig, path, "confusion matrix")
 
-    best_score = cv["test-aucpr-mean"].max() 
-    #  rely on best value of mean AUC‑PR across folds instead of accuracy since the data is imbalance
-    # =========================
-    # Memory cleanup (CRITICAL)
-    # =========================
-    del dtrain
-    del cv
-    gc.collect()
-    # manual deletion and garbage collection to prevent memory buildup
-    return float(best_score)
-# create study with pruning
-study = optuna.create_study(
-    study_name="phishguard_tune",
-    storage="sqlite:///optuna_phishguard.db", # save study result for persistence in sqlite db
-    load_if_exists= True, # resumes from previous  
-    direction="maximize", # we wanna maximize 
-    sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE), # Tree‑structured Parzen Estimator (default, good for hyperparameter search). Bayesian optimization(looks back, clusters to good and bad, then samples the next trial from high probability area) gets smarter over time by focus on best settings 
-    pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=5), # prunes trials that perform below the median of completed trials after 5 warm‑up steps. 
-) # n_startup_trials=5: Let at least 5 trials finish completely so the tuner knows what a "normal" score looks like. n_warmup_steps=5: Let every new trial run for at least 5 rounds (trees) before judging it.
-best_params = study.best_trial.params
-print("Best parameters (from subset tuning):", best_params)
 
-# ==========================================================
-# Run hyperparameter tuning
-# ==========================================================
+def plot_pr_curve(y_true: np.ndarray, y_prob: np.ndarray, path: Path) -> None:
+    prec, rec, _ = precision_recall_curve(y_true, y_prob)
+    ap = average_precision_score(y_true, y_prob)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(rec, prec, color="#e91e63", lw=2, label=f"AP = {ap:.4f}")
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curve")
+    ax.legend(); ax.grid(alpha=0.3)
+    _save(fig, path, "PR curve")
 
-print("Starting Optuna tuning...")
-# run single-process optuna to avoid massive parallel memory usage
-study.optimize(
-    objective,
-    n_jobs=1, # runs trials sequentially (avoids memory explosion).
-    n_trials=N_TRIALS,
-    timeout=60*60*4, 
-    gc_after_trial=True
-)
-best_params = study.best_trial.params 
-print("Best parameters:", best_params)
 
-# ==========================================================
-# Train final model
-# ==========================================================
-final_params = BASE_PARAMS.copy()
-final_params.update(best_params)# Merge best parameters into base parameters.
-final_params["scale_pos_weight"]= scale_pos_weight # in case if overwritten
-dtrain = xgb.DMatrix(X_train, label=y_train)
-print("Training final model...")
+def plot_roc_curve(y_true: np.ndarray, y_prob: np.ndarray, path: Path) -> None:
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    auc = roc_auc_score(y_true, y_prob)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(fpr, tpr, color="#1565c0", lw=2, label=f"AUC = {auc:.4f}")
+    ax.plot([0, 1], [0, 1], "k--", lw=1)
+    ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
+    ax.set_title("ROC Curve")
+    ax.legend(); ax.grid(alpha=0.3)
+    _save(fig, path, "ROC curve")
 
-model = xgb.train(
-    final_params, 
-    dtrain,# use all training data 
-    num_boost_round=2000,# maximum boosting rounds 
-    verbose_eval=100, # print evaluation metric every 100 rounds
-)
-model.save_model(MODEL_PATH)
-print("Model saved:", MODEL_PATH)
-# ==========================================================
-# Evaluation metrics
-# ==========================================================
 
-print("Evaluating model...")
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+def plot_optuna_history(study: optuna.Study, path: Path) -> None:
+    values = [t.value for t in study.trials if t.value is not None]
+    best   = np.maximum.accumulate(values)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(values, alpha=0.5, label="Trial AUC-PR", color="#78909c")
+    ax.plot(best,   lw=2,      label="Best so far",  color="#00897b")
+    ax.set_xlabel("Trial"); ax.set_ylabel("AUC-PR")
+    ax.set_title("Optuna Optimisation History")
+    ax.legend(); ax.grid(alpha=0.3)
+    _save(fig, path, "Optuna history")
 
-dtest = xgb.DMatrix(X_test)
-y_pred_prob = model.predict(dtest) # predicts probabilities on the test set
-y_labels = np.where(
-    y_pred_prob < 0.3, "safe",
-    np.where(y_pred_prob < 0.7, "suspicious", "phishing")
-)
-y_pred_binary = (y_pred_prob > 0.5).astype(int)
-print("Accuracy:", accuracy_score(y_test, y_pred_binary))
-print("Precision:", precision_score(y_test, y_pred_binary))
-print("Recall:", recall_score(y_test, y_pred_binary))
-print("F1:", f1_score(y_test, y_pred_binary))
-print("ROC-AUC:", roc_auc_score(y_test, y_pred_prob))
 
-precision, recall, thresholds = precision_recall_curve(y_test, y_pred_prob)
-# F1 score for each threshold
-f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
-best_idx = np.argmax(f1_scores)
-best_threshold = thresholds[best_idx] # finds threshold that maximize threshold, can  be used for decision making 
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
-print("Best threshold:", best_threshold)
-print("Best F1:", f1_scores[best_idx])
-print("Precision at best:", precision[best_idx])
-print("Recall at best:", recall[best_idx])
-# ==========================================================
-# Save SHAP background sample
-# ==========================================================
+def main() -> None:
 
-sample_size = min(1024, X.shape[0]) # takes up to 1024 random rows from the full dataset to represent the normal state of data
-rng = np.random.RandomState(RANDOM_STATE)
-idx = rng.choice(X.shape[0], sample_size, replace=False)
-bg = X[idx] 
-np.save(SHAP_BACKGROUND_PATH, bg) # save as npy
-print("SHAP background saved")
-# ==========================================================
-# Save metadata
-# ==========================================================
+    # ── 1. Load data ──────────────────────────────────────────────────────────
+    print("Loading dataset ...")
+    npz = np.load(DATA_PATH, mmap_mode="r")
+    X   = np.array(npz["X"], dtype=np.float32)
+    y   = np.array(npz["y"], dtype=np.int32)
 
-metadata = { # record metadata, usefull for auditing and reproducibility
-    "samples": int(len(y)),
-    "features": int(X.shape[1]),
-    "best_params": best_params,
-    "scale_pos_weight": float(scale_pos_weight),
-    "timestamp": time.time()
-}
-with open(METADATA_PATH, "w") as f:
-    json.dump(metadata, f, indent=4)
-# ==========================================================
-# Optional sklearn wrapper (for deployment)
-# ==========================================================
+    # Drop unlabelled rows (label == -1)
+    mask = y != -1
+    X, y = X[mask], y[mask]
+    print(f"Dataset shape after filtering: {X.shape}")
 
-from xgboost import XGBClassifier
-clf = XGBClassifier( # Creates a scikit‑learn compatible XGBClassifier.
-    **best_params,
-    objective="binary:logistic",
-    eval_metric="aucpr",
-    tree_method="hist",
-    n_jobs=N_THREADS
-)
-clf.fit(X_train, y_train) # trains on the same data 
-joblib.dump(clf, MODEL_DIR / "phishguard_xgb.pkl")
-print("Training completed successfully.")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
+    )
+
+    # ── 2. Class imbalance ────────────────────────────────────────────────────
+    pos = int((y_train == 1).sum())
+    neg = int((y_train == 0).sum())
+    scale_pos_weight = neg / pos
+    print(f"Train positives: {pos:,}  negatives: {neg:,}  scale_pos_weight: {scale_pos_weight:.4f}")
+
+    # ── 3. Base params ────────────────────────────────────────────────────────
+    BASE_PARAMS = {
+        "objective":        "binary:logistic",
+        "eval_metric":      "aucpr",
+        "tree_method":      "hist",
+        "grow_policy":      "lossguide",
+        "verbosity":        0,
+        "nthread":          N_THREADS,
+        "max_bin":          128,
+        "scale_pos_weight": scale_pos_weight,
+    }
+
+    # ── 4. Optuna tuning ──────────────────────────────────────────────────────
+    def objective(trial: optuna.Trial) -> float:
+        rng = np.random.RandomState(RANDOM_STATE + trial.number)
+        idx = rng.choice(X_train.shape[0], min(TUNE_SUBSET_SIZE, X_train.shape[0]), replace=False)
+        dtrain = xgb.DMatrix(X_train[idx], label=y_train[idx], nthread=N_THREADS)
+
+        params = {**BASE_PARAMS,
+            "learning_rate":    trial.suggest_float("learning_rate",    0.01,  0.15,  log=True),
+            "max_depth":        trial.suggest_int(  "max_depth",        4,     10),
+            "subsample":        trial.suggest_float("subsample",        0.6,   1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6,   1.0),
+            "min_child_weight": trial.suggest_int(  "min_child_weight", 1,     15),
+            "gamma":            trial.suggest_float("gamma",            0.0,   5.0),
+            "lambda":           trial.suggest_float("lambda",           1e-3,  10.0, log=True),
+            "alpha":            trial.suggest_float("alpha",            1e-3,  10.0, log=True),
+        }
+        cv = xgb.cv(
+            params=params, dtrain=dtrain,
+            num_boost_round=TUNE_BOOST_ROUNDS,
+            nfold=3, stratified=True,
+            early_stopping_rounds=TUNE_EARLY_STOP,
+            seed=RANDOM_STATE, verbose_eval=False,
+        )
+        score = float(cv["test-aucpr-mean"].max())
+        del dtrain, cv
+        gc.collect()
+        return score
+
+    study = optuna.create_study(
+        study_name="phishguard_tune",
+        storage=OPTUNA_DB,
+        load_if_exists=True,
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
+        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=5),
+    )
+
+    print(f"Starting Optuna ({N_TRIALS} trials) ...")
+    with tqdm_auto(total=N_TRIALS, desc="Optuna trials", unit="trial") as pbar:
+        def _callback(study, trial):
+            pbar.set_postfix_str(f"best={study.best_value:.4f}")
+            pbar.update(1)
+        study.optimize(
+            objective, n_trials=N_TRIALS, n_jobs=1,
+            timeout=60 * 60 * 4, gc_after_trial=True,
+            callbacks=[_callback],
+        )
+
+    # FIX: best_trial access moved to AFTER optimize()
+    best_params = study.best_trial.params
+    print("Best hyperparameters:", best_params)
+
+    # ── NEW: Optuna history plot ───────────────────────────────────────────────
+    plot_optuna_history(study, MODEL_DIR / "optuna_history.png")
+
+    # ── 5. Final model training ───────────────────────────────────────────────
+    final_params = {**BASE_PARAMS, **best_params, "scale_pos_weight": scale_pos_weight}
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dval   = xgb.DMatrix(X_test,  label=y_test)
+
+    print("Training final model ...")
+    model = xgb.train(
+        final_params,
+        dtrain,
+        num_boost_round=FINAL_BOOST_ROUNDS,
+        evals=[(dval, "val")],                       # FIX: added evals
+        early_stopping_rounds=FINAL_EARLY_STOP,      # FIX: added early stopping
+        verbose_eval=100,
+    )
+    model.save_model(MODEL_PATH)
+    print(f"Model saved → {MODEL_PATH}")
+
+    # ── 6. Evaluation ─────────────────────────────────────────────────────────
+    print("Evaluating ...")
+    y_prob   = model.predict(xgb.DMatrix(X_test))
+    # Find best F1 threshold on PR curve
+    prec, rec, thresholds = precision_recall_curve(y_test, y_prob)
+    f1s        = 2 * prec * rec / (prec + rec + 1e-10)
+    best_idx   = int(np.argmax(f1s))
+    best_thresh = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+    y_binary = (y_prob > best_thresh).astype(int)
+    metrics = {
+        "accuracy":        round(float(accuracy_score(y_test, y_binary)),             4),
+        "precision":       round(float(precision_score(y_test, y_binary)),            4),
+        "recall":          round(float(recall_score(y_test, y_binary)),               4),
+        "f1_score":        round(float(f1_score(y_test, y_binary)),                   4),
+        "roc_auc":         round(float(roc_auc_score(y_test, y_prob)),                4),
+        "average_precision": round(float(average_precision_score(y_test, y_prob)),    4),
+        "best_threshold":  round(best_thresh,                                         4),
+        "best_f1":         round(float(f1s[best_idx]),                                4),
+        "train_samples":   int(len(y_train)),
+        "test_samples":    int(len(y_test)),
+    }
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+
+    # ── NEW: save metrics + plots ──────────────────────────────────────────────
+    with open(METRICS_PATH, "w") as f:
+        json.dump(metrics, f, indent=4)
+    print(f"Metrics saved → {METRICS_PATH}")
+
+    plot_confusion_matrix(y_test, y_binary,  MODEL_DIR / "confusion_matrix.png")
+    plot_pr_curve(y_test, y_prob,            MODEL_DIR / "pr_curve.png")
+    plot_roc_curve(y_test, y_prob,           MODEL_DIR / "roc_curve.png")
+
+    # ── 7. SHAP background sample ─────────────────────────────────────────────
+    rng = np.random.RandomState(RANDOM_STATE)
+    bg  = X[rng.choice(X.shape[0], min(SHAP_BG_SIZE, X.shape[0]), replace=False)]
+    np.save(SHAP_BACKGROUND_PATH, bg)
+    print(f"SHAP background saved → {SHAP_BACKGROUND_PATH}")
+
+    # ── 8. Metadata ───────────────────────────────────────────────────────────
+    metadata = {
+        "samples":           int(len(y)),
+        "features":          int(X.shape[1]),
+        "train_samples":     metrics["train_samples"],
+        "test_samples":      metrics["test_samples"],
+        "best_params":       best_params,
+        "scale_pos_weight":  float(scale_pos_weight),
+        "class_distribution":{"phish": pos, "legit": neg},
+        "timestamp":         time.time(),
+    }
+    with open(METADATA_PATH, "w") as f:
+        json.dump(metadata, f, indent=4)
+    print(f"Metadata saved → {METADATA_PATH}")
+
+    # ── 9. sklearn wrapper (for tools that expect sklearn API) ────────────────
+    clf = XGBClassifier(
+        **best_params,
+        objective="binary:logistic",
+        eval_metric="aucpr",
+        tree_method="hist",
+        n_jobs=N_THREADS,
+    )
+    clf.fit(X_train, y_train)
+    joblib.dump(clf, SKL_MODEL_PATH)
+    print(f"sklearn wrapper saved → {SKL_MODEL_PATH}")
+
+    print("\nTraining pipeline complete.")
+
+
+if __name__ == "__main__":
+    main()

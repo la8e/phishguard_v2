@@ -1,0 +1,45 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Raw datasets (large, sourced externally)
+data/raw/
+
+# Processed / generated
+data/processed/embed_output/
+data/processed/phishguard_features.csv
+
+# FastText binary (very large)
+src/features/fastText/
+
+# Trained model
+models/manual_scaler.pkl
+models/phishguard_xgb.pkl
+models/phishguard_xgb.json
+models/shap_background.npy
+models/optuna_phishguard.db
+
+# Logs
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

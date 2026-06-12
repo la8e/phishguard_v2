@@ -1,0 +1,22 @@
+
+# Raw and processed training data — never needed at runtime
+data/
+logs/
+
+# Artifacts excluded from lite/full (mounted at runtime for those profiles)
+# Standalone and selfcontained Dockerfiles COPY these explicitly,
+# so they are NOT excluded here — Docker only uses what each COPY asks for.
+
+# not needed at runtime
+models/optuna_phishguard.db
+models/eval_metrics.json
+models/*.png
+models/train_XGBOOST.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+.git/

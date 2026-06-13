@@ -30,6 +30,7 @@ FASTTEXT_URL = ("https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.en.300
 FASTTEXT_GZ_SIZE_APPROX = 4_200_000_000   # ~4.2 GB compressed
 FASTTEXT_BIN_SIZE_APPROX = 7_000_000_000  # ~7.0 GB decompressed
 MIN_FREE_DISK = FASTTEXT_GZ_SIZE_APPROX + FASTTEXT_BIN_SIZE_APPROX + 500_000_000
+XGBOOST_VERSION = "xgboost==3.2.0"
 MAX_VT_RETRIES  = 5   # not used here but documents the constant for vt_client
 
 
@@ -117,7 +118,6 @@ print("Git found.")
 
 
 # STEP 2 - CLONE REPOSITORY
-print()
 print("[2/6] Cloning repository...")
 repo_dir = Path(REPO_NAME)
 if not repo_dir.exists():
@@ -128,7 +128,6 @@ else:
 
 
 # STEP 3 - VIRTUAL ENVIRONMENT
-print()
 print("[3/6] Creating virtual environment...")
 venv_dir = repo_dir / ".venv"
 if not venv_dir.exists():
@@ -144,7 +143,6 @@ if not python_exe.exists():
 
 
 # STEP 4 - INSTALL DEPENDENCIES
-print()
 print("[4/6] Installing dependencies...")
 
 req_path = repo_dir / "requirements.txt"
@@ -163,7 +161,6 @@ run([
 
 # Install XGBoost without CUDA transitive dependencies.
 # --no-deps prevents pip from pulling the full CUDA stack onto a CPU machine.
-print()
 print("Installing XGBoost (CPU-only)...")
 run([
     str(python_exe), "-m", "pip", "install",
@@ -181,7 +178,6 @@ print("Dependencies installed.")
 
 
 # STEP 5 - FASTTEXT DIRECTORY
-print()
 print("[5/6] Preparing FastText model directory...")
 fasttext_dir = repo_dir / "src" / "features" / "fastText"
 fasttext_dir.mkdir(parents=True, exist_ok=True)
@@ -190,7 +186,6 @@ gz_path     = fasttext_dir / "cc.en.300.bin.gz"
 
 
 # STEP 6 - DOWNLOAD + EXTRACT FASTTEXT
-print()
 if model_path.exists():
     print("[6/6] FastText model already exists. Skipping download.")
 else:
@@ -246,11 +241,9 @@ else:
     print("FastText model extracted successfully.")
 
 # DONE
-print()
 print("Setup completed successfully.")
 print("- To run PhishGuard:")
-print(f"  {get_activation_hint(venv_dir)}")
-print(f"  python src/predictor.py")
-print()
+print(f" {get_activation_hint(venv_dir)}")
+print(f" python src/predictor.py")
 print("- With VirusTotal enrichment:")
-print(f"  python src/predictor.py --vt-key YOUR_API_KEY")
+print(f" python src/predictor.py --vt-key YOUR_API_KEY")
